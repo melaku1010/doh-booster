@@ -3,24 +3,23 @@ const app = express();
 
 const PORT = process.env.PORT || 3000;
 
-// Upstream resolvers, tried in order (failover)
-// Override on Railway with env var UPSTREAMS (comma-separated DoH URLs)
+// Optimized Upstream Resolvers (Using primary high-performance low-latency nodes)
 const UPSTREAMS = (process.env.UPSTREAMS ||
-  'https://cloudflare-dns.com/dns-query,https://dns.google/dns-query,https://dns.quad9.net/dns-query'
+  'https://cloudflare-dns.com/dns-query,https://dns.google/dns-query'
 ).split(',').map(u => u.trim()).filter(Boolean);
-// RACE=true asks all upstreams at once and uses the fastest answer
-const RACE = process.env.RACE !== 'false';
-const UPSTREAM_TIMEOUT_MS = 3000;
 
-// ---------- Simple in-memory DNS cache ----------
-const CACHE_MAX = 5000;
-const MIN_TTL = 10;   // seconds
-const MAX_TTL = 300;  // seconds
-const cache = new Map(); // key -> { buf, expires }
+const RACE = process.env.RACE !== 'false';
+const UPSTREAM_TIMEOUT_MS = 2000; // Reduced timeout for faster failover/response
+
+// ---------- Expanded In-Memory DNS Cache for Zero-Lag Gaming ----------
+const CACHE_MAX = 10000; // Expanded cache size to remember game server IPs longer
+const MIN_TTL = 60;      // Minimum cache time increased to 60s to prevent constant re-querying
+const MAX_TTL = 3600;  // Max cache time up to 1 hour for stable session mapping
+const cache = new Map();
 
 function cacheKey(query) {
   const copy = Buffer.from(query);
-  copy[0] = 0; // ignore the DNS transaction ID
+  copy[0] = 0; 
   copy[1] = 0;
   return copy.toString('base64');
 }
@@ -35,12 +34,11 @@ function skipName(buf, o) {
   return o;
 }
 
-// Returns TTL in seconds to cache for, or 0 if it should not be cached
 function responseTtl(buf) {
   try {
     if (buf.length < 12) return 0;
     const rcode = buf[3] & 0x0f;
-    if (rcode !== 0 && rcode !== 3) return 0; // don't cache SERVFAIL etc.
+    if (rcode !== 0 && rcode !== 3) return 0;
     const qd = buf.readUInt16BE(4);
     const records = buf.readUInt16BE(6) + buf.readUInt16BE(8);
     let o = 12;
@@ -53,7 +51,7 @@ function responseTtl(buf) {
       min = Math.min(min, ttl);
       o += 10 + rdlen;
     }
-    if (min === Infinity) min = 30;
+    if (min === Infinity) min = 60;
     return Math.max(MIN_TTL, Math.min(MAX_TTL, min));
   } catch {
     return 0;
@@ -68,7 +66,7 @@ function cacheGet(query) {
     return null;
   }
   const out = Buffer.from(hit.buf);
-  out[0] = query[0]; // restore the client's transaction ID
+  out[0] = query[0]; 
   out[1] = query[1];
   return out;
 }
@@ -80,7 +78,6 @@ function cacheSet(query, response) {
   cache.set(cacheKey(query), { buf: Buffer.from(response), expires: Date.now() + ttl * 1000 });
 }
 
-// ---------- Upstream queries ----------
 async function askUpstream(url, query, ctrl) {
   const timer = setTimeout(() => ctrl.abort(), UPSTREAM_TIMEOUT_MS);
   try {
@@ -106,7 +103,6 @@ async function resolve(query) {
 
   let buf;
   if (RACE) {
-    // Fastest upstream wins; the others are cancelled
     const ctrls = UPSTREAMS.map(() => new AbortController());
     try {
       buf = await Promise.any(UPSTREAMS.map((u, i) => askUpstream(u, query, ctrls[i])));
@@ -121,7 +117,6 @@ async function resolve(query) {
         break;
       } catch (err) {
         lastErr = err;
-        console.warn(`[!] ${url} failed: ${err.message}`);
       }
     }
     if (!buf) throw lastErr;
@@ -130,13 +125,11 @@ async function resolve(query) {
   return buf;
 }
 
-// ---------- Middleware ----------
 app.use(express.raw({ type: 'application/dns-message', limit: '1mb' }));
 app.use(express.json());
 
-// ---------- Routes ----------
 app.get('/', (req, res) => {
-  res.status(200).send('DoH Booster Backend is running successfully!');
+  res.status(200).send('Stable eFootball DoH Booster is active!');
 });
 
 app.get('/health', (req, res) => {
@@ -147,17 +140,16 @@ async function handleDoh(req, res) {
   let query = null;
 
   if (req.method === 'POST' && Buffer.isBuffer(req.body) && req.body.length > 0) {
-    query = req.body; // binary DNS query (RFC 8484 POST)
+    query = req.body; 
   } else if (req.method === 'GET' && typeof req.query.dns === 'string') {
-    query = Buffer.from(req.query.dns, 'base64url'); // RFC 8484 GET
+    query = Buffer.from(req.query.dns, 'base64url'); 
   }
 
-  // Not a DNS query: simple status response for browser testing
   if (!query || query.length < 12) {
     return res.status(200).json({
       status: 'active',
       booster: req.params.id || null,
-      message: 'Custom routing endpoint is live and operational.',
+      message: 'Stable routing endpoint is live.',
     });
   }
 
@@ -165,22 +157,21 @@ async function handleDoh(req, res) {
     const answer = await resolve(query);
     res.set({
       'Content-Type': 'application/dns-message',
-      'Cache-Control': 'max-age=30',
+      'Cache-Control': 'max-age=60',
       'Access-Control-Allow-Origin': '*',
     });
     return res.status(200).send(answer);
   } catch (err) {
-    console.error('[-] All upstreams failed:', err.message);
+    console.error('[-] Upstream failed:', err.message);
     return res.status(502).send('Bad Gateway');
   }
 }
 
 app.all('/b/:id', (req, res) => {
-  console.log(`[+] ${req.method} booster profile: ${req.params.id}`);
   handleDoh(req, res);
 });
 app.all('/dns-query', handleDoh);
 
 app.listen(PORT, () => {
-  console.log(`Server is listening on port ${PORT}`);
+  console.log(`Stable server listening on port ${PORT}`);
 });
