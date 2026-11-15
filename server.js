@@ -3,23 +3,23 @@ const app = express();
 
 const PORT = process.env.PORT || 3000;
 
-// High-performance European edge resolvers for optimal peering from Amsterdam
+// High-performance primary upstream resolvers optimized for European peering nodes
 const UPSTREAMS = (process.env.UPSTREAMS ||
   'https://cloudflare-dns.com/dns-query,https://dns.google/dns-query'
 ).split(',').map(u => u.trim()).filter(Boolean);
 
 const RACE = process.env.RACE !== 'false';
-const UPSTREAM_TIMEOUT_MS = 1500; // Ultra-fast timeout to prevent stalling
+const UPSTREAM_TIMEOUT_MS = 1500; // Ultra-fast timeout to prevent request stalls
 
-// ---------- Gaming-Optimized In-Memory DNS Cache ----------
+// ---------- Aggressive DNS Cache for Stable Match Sessions ----------
 const CACHE_MAX = 15000;
-const MIN_TTL = 300;   // Force a minimum 5-minute cache so IPs never change mid-match
-const MAX_TTL = 7200;  // Max cache time (2 hours) for rock-solid session stability
+const MIN_TTL = 300;   // Forces a minimum 5-minute cache so IP addresses stay locked during matches
+const MAX_TTL = 7200;  // Max cache duration (2 hours)
 const cache = new Map();
 
 function cacheKey(query) {
   const copy = Buffer.from(query);
-  copy[0] = 0; // Ignore transaction ID for cache matching
+  copy[0] = 0; 
   copy[1] = 0;
   return copy.toString('base64');
 }
@@ -34,25 +34,6 @@ function skipName(buf, o) {
   return o;
 }
 
-// Extract domain name from DNS query buffer for logging/tuning
-function extractDomain(buf) {
-  try {
-    let o = 12;
-    let parts = [];
-    while (o < buf.length) {
-      const len = buf[o];
-      if (len === 0) break;
-      if ((len & 0xc0) === 0xc0) break; // compression pointer
-      parts.push(buf.toString('utf8', o + 1, o + 1 + len));
-      o += len + 1;
-    }
-    return parts.join('.');
-  } catch {
-    return 'unknown';
-  }
-}
-
-// Enforce stable TTLs so game endpoints don't fluctuate mid-match
 function responseTtl(buf) {
   try {
     if (buf.length < 12) return 0;
@@ -120,11 +101,6 @@ async function resolve(query) {
   const cached = cacheGet(query);
   if (cached) return cached;
 
-  const domain = extractDomain(query);
-  if (domain.includes('konami') || domain.includes('efootball') || domain.includes('net')) {
-    console.log(`[+] Gaming query intercepted: ${domain}`);
-  }
-
   let buf;
   if (RACE) {
     const ctrls = UPSTREAMS.map(() => new AbortController());
@@ -153,7 +129,7 @@ app.use(express.raw({ type: 'application/dns-message', limit: '1mb' }));
 app.use(express.json());
 
 app.get('/', (req, res) => {
-  res.status(200).send('Konami-Optimized DoH Booster is active!');
+  res.status(200).send('Optimized DoH Booster is active!');
 });
 
 app.get('/health', (req, res) => {
@@ -173,7 +149,7 @@ async function handleDoh(req, res) {
     return res.status(200).json({
       status: 'active',
       booster: req.params.id || null,
-      message: 'Gaming DoH endpoint is live.',
+      message: 'DoH endpoint is live.',
     });
   }
 
@@ -197,5 +173,5 @@ app.all('/b/:id', (req, res) => {
 app.all('/dns-query', handleDoh);
 
 app.listen(PORT, () => {
-  console.log(`Konami-optimized DoH server listening on port ${PORT}`);
+  console.log(`Server listening on port ${PORT}`);
 });
