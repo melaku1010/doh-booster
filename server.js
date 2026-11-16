@@ -1,134 +1,157 @@
 const express = require('express');
+const dnsPacket = require('dns-packet');
+
 const app = express();
-
 const PORT = process.env.PORT || 3000;
-const UPSTREAM = 'https://cloudflare-dns.com/dns-query';
-const TIMEOUT_MS = 2000;
 
-// Massive local cache to lock session routes for hours
+// Google DoH supports EDNS Client Subnet (ECS) for GeoDNS steering
+const UPSTREAM_ECS = 'https://dns.google/dns-query';
+const UPSTREAM_FAST = 'https://cloudflare-dns.com/dns-query';
+
+// Frankfurt/Amsterdam core peering subnet to steer Anycast/GeoDNS game servers
+const SPOOF_ECS_IP = process.env.ECS_IP || '185.156.46.0';
+const LOCKED_TTL = 3600;
+
 const cache = new Map();
-const TTL_LOCK = 14400; // 4 hours hard lock to prevent any mid-match re-resolution
 
-function parseQueryDomain(buf) {
-  try {
-    let o = 12;
-    let parts = [];
-    while (o < buf.length) {
-      const len = buf[o];
-      if (len === 0) break;
-      if ((len & 0xc0) === 0xc0) break;
-      parts.push(buf.toString('utf8', o + 1, o + 1 + len));
-      o += len + 1;
-    }
-    return parts.join('.').toLowerCase();
-  } catch {
-    return '';
-  }
+// Keywords used by Konami / eFootball mobile infrastructure
+const GAME_KEYWORDS = [
+  'konami',
+  'efootball',
+  'pes',
+  'awsglobalaccelerator',
+  'googleusercontent',
+  'akamaiedge',
+  'cloudfront'
+];
+
+function isGameDomain(name) {
+  if (!name) return false;
+  const lower = name.toLowerCase();
+  return GAME_KEYWORDS.some(kw => lower.includes(kw));
 }
 
-function modifyTtlAndCache(query, response) {
-  try {
-    if (response.length < 12) return;
-    const rcode = response[3] & 0x0f;
-    if (rcode !== 0 && rcode !== 3) return;
-
-    const qd = response.readUInt16BE(4);
-    const records = response.readUInt16BE(6) + response.readUInt16BE(8);
-    let o = 12;
-    for (let i = 0; i < qd; i++) {
-      while (o < response.length) {
-        const len = response[o];
-        if (len === 0) { o += 1; break; }
-        if ((len & 0xc0) === 0xc0) { o += 2; break; }
-        o += len + 1;
+// Inject EDNS0 Client Subnet option into outgoing DNS query
+function addEdnsSubnet(decodedQuery, ip) {
+  const additionals = (decodedQuery.additionals || []).filter(r => r.type !== 'OPT');
+  additionals.push({
+    type: 'OPT',
+    name: '.',
+    udpPayloadSize: 4096,
+    extendedRcode: 0,
+    ednsVersion: 0,
+    flags: 0,
+    flag_do: false,
+    options: [
+      {
+        code: 'CLIENT_SUBNET',
+        family: 1, // IPv4
+        sourcePrefixLength: 24,
+        scopePrefixLength: 0,
+        ip: ip
       }
-      o += 4; // skip QTYPE/QCLASS
-    }
-
-    // Force every returned DNS record to carry our max locked TTL
-    for (let i = 0; i < records; i++) {
-      while (o < response.length) {
-        const len = response[o];
-        if (len === 0) { o += 1; break; }
-        if ((len & 0xc0) === 0xc0) { o += 2; break; }
-        o += len + 1;
-      }
-      if (o + 10 <= response.length) {
-        response.writeUInt32BE(TTL_LOCK, o + 4); // Overwrite TTL
-        const rdlen = response.readUInt16BE(o + 8);
-        o += 10 + rdlen;
-      } else {
-        break;
-      }
-    }
-
-    const key = Buffer.from(query);
-    key[0] = 0; key[1] = 0; // ignore transaction ID for caching
-    cache.set(key.toString('base64'), { buf: Buffer.from(response), expires: Date.now() + TTL_LOCK * 1000 });
-  } catch (err) {
-    console.error('TTL modification error:', err.message);
-  }
+    ]
+  });
+  decodedQuery.additionals = additionals;
+  return dnsPacket.encode(decodedQuery);
 }
 
-async function resolveDoh(query) {
-  const key = Buffer.from(query);
-  key[0] = 0; key[1] = 0;
-  const cacheKeyStr = key.toString('base64');
-  
-  const cached = cache.get(cacheKeyStr);
+// Strip AAAA (IPv6) for game domains and lock A records to a single deterministic IP
+function optimizeGameResponse(decodedResp, domain) {
+  if (!decodedResp.answers || decodedResp.answers.length === 0) return decodedResp;
+
+  const aRecords = decodedResp.answers.filter(a => a.type === 'A');
+  const otherRecords = decodedResp.answers.filter(a => a.type !== 'A' && a.type !== 'AAAA');
+
+  if (aRecords.length > 0) {
+    // Sort IPs deterministically and pick ONLY ONE to prevent round-robin server hopping
+    aRecords.sort((a, b) => a.data.localeCompare(b.data));
+    const chosenRecord = aRecords[0];
+    chosenRecord.ttl = LOCKED_TTL;
+
+    decodedResp.answers = [...otherRecords, chosenRecord];
+    console.log(`[GAME PIN] ${domain} -> Locked single IP: ${chosenRecord.data} (dropped ${aRecords.length - 1} alt IPs)`);
+  }
+
+  return decodedResp;
+}
+
+async function resolveQuery(rawQueryBuffer) {
+  const decoded = dnsPacket.decode(rawQueryBuffer);
+  const question = decoded.questions && decoded.questions[0];
+  const qName = question ? question.name : '';
+  const qType = question ? question.type : '';
+  const gameTraffic = isGameDomain(qName);
+
+  // Block IPv6 (AAAA) queries for game domains to force pure IPv4 low-jitter routing
+  if (gameTraffic && qType === 'AAAA') {
+    return dnsPacket.encode({
+      id: decoded.id,
+      type: 'response',
+      flags: 384, // QR + RD + RA
+      questions: decoded.questions,
+      answers: []
+    });
+  }
+
+  const cacheKey = `${qName}:${qType}`;
+  const cached = cache.get(cacheKey);
   if (cached && cached.expires > Date.now()) {
-    const out = Buffer.from(cached.buf);
-    out[0] = query[0]; // restore client transaction ID
-    out[1] = query[1];
-    return out;
+    const resp = dnsPacket.decode(cached.buf);
+    resp.id = decoded.id;
+    return dnsPacket.encode(resp);
   }
+
+  // Steer game traffic using ECS via Google DoH; normal traffic via Cloudflare
+  const targetUpstream = gameTraffic ? UPSTREAM_ECS : UPSTREAM_FAST;
+  const outboundBuffer = gameTraffic
+    ? addEdnsSubnet(decoded, SPOOF_ECS_IP)
+    : rawQueryBuffer;
 
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => ctrl.abort(), 2500);
 
   try {
-    const res = await fetch(UPSTREAM, {
+    const r = await fetch(targetUpstream, {
       method: 'POST',
       headers: {
-        Accept: 'application/dns-message',
-        'Content-Type': 'application/dns-message',
+        'Accept': 'application/dns-message',
+        'Content-Type': 'application/dns-message'
       },
-      body: query,
-      signal: ctrl.signal,
+      body: outboundBuffer,
+      signal: ctrl.signal
     });
 
-    if (!res.ok) throw new Error(`Upstream error: ${res.status}`);
-    const buf = Buffer.from(await res.arrayBuffer());
+    if (!r.ok) throw new Error(`Upstream HTTP ${r.status}`);
+    const rawResp = Buffer.from(await r.arrayBuffer());
 
-    const domain = parseQueryDomain(query);
-    if (domain.includes('konami') || domain.includes('efootball')) {
-      console.log(`[STABLE PIN] Locked game domain target: ${domain}`);
+    let finalBuffer = rawResp;
+    if (gameTraffic) {
+      let decodedResp = dnsPacket.decode(rawResp);
+      decodedResp = optimizeGameResponse(decodedResp, qName);
+      decodedResp.id = decoded.id;
+      finalBuffer = dnsPacket.encode(decodedResp);
     }
 
-    modifyTtlAndCache(query, buf);
+    cache.set(cacheKey, {
+      buf: finalBuffer,
+      expires: Date.now() + (gameTraffic ? LOCKED_TTL * 1000 : 300 * 1000)
+    });
 
-    buf[0] = query[0];
-    buf[1] = query[1];
-    return buf;
+    return finalBuffer;
   } finally {
     clearTimeout(timer);
   }
 }
 
 app.use(express.raw({ type: 'application/dns-message', limit: '1mb' }));
-app.use(express.json());
 
 app.get('/', (req, res) => {
-  res.status(200).send('Deep-Pinned DoH Booster Online');
-});
-
-app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'ok', pinnedSessions: cache.size, uptime: process.uptime() });
+  res.status(200).send('ECS + Single-IP Pinned DoH Engine Active');
 });
 
 async function handleDoh(req, res) {
   let query = null;
-
   if (req.method === 'POST' && Buffer.isBuffer(req.body) && req.body.length > 0) {
     query = req.body;
   } else if (req.method === 'GET' && typeof req.query.dns === 'string') {
@@ -136,19 +159,18 @@ async function handleDoh(req, res) {
   }
 
   if (!query || query.length < 12) {
-    return res.status(200).json({ status: 'active', profile: req.params.id || 'default' });
+    return res.status(400).send('Invalid DNS query');
   }
 
   try {
-    const answer = await resolveDoh(query);
+    const answer = await resolveQuery(query);
     res.set({
       'Content-Type': 'application/dns-message',
-      'Cache-Control': 'public, max-age=14400',
-      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'no-store'
     });
     return res.status(200).send(answer);
   } catch (err) {
-    console.error('Resolution failed:', err.message);
+    console.error('DNS error:', err.message);
     return res.status(502).send('Bad Gateway');
   }
 }
@@ -157,5 +179,5 @@ app.all('/b/:id', handleDoh);
 app.all('/dns-query', handleDoh);
 
 app.listen(PORT, () => {
-  console.log(`Deep-pinned DoH server listening on port ${PORT}`);
+  console.log(`ECS Packet-Rewriting DoH Server listening on port ${PORT}`);
 });
