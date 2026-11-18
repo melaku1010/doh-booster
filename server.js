@@ -5,7 +5,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // Primary gaming resolver (mirrors the exact relay cluster pool) + fallback
-const GAME_UPSTREAM = process.env.GAME_UPSTREAM || 'https://ebuzz-boost-production.up.railway.app/b/efb-g4oztl';
+const GAME_UPSTREAM = process.env.GAME_UPSTREAM || 'https://ebuzz-boost-production.up.railway.app/b/efb-hgxvyh';
 const FALLBACK_UPSTREAM = 'https://dns.google/dns-query';
 const WEB_UPSTREAM = 'https://cloudflare-dns.com/dns-query';
 
