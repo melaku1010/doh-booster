@@ -4,15 +4,12 @@ const dnsPacket = require('dns-packet');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Primary gaming resolver (mirrors the exact relay cluster pool) + fallback
-const GAME_UPSTREAM = process.env.GAME_UPSTREAM || 'https://ebuzz-boost-production.up.railway.app/b/efb-hgxvyh';
+// Your friend's active upstream link for shared relay routing
+const GAME_UPSTREAM = 'https://ebuzz-boost-production.up.railway.app/b/efb-hgxvyh';
 const FALLBACK_UPSTREAM = 'https://dns.google/dns-query';
 const WEB_UPSTREAM = 'https://cloudflare-dns.com/dns-query';
 
-// Optional: Hardcode exact IPs once you see them in /stats (e.g., { "pes20-game.konami.net": "1.2.3.4" })
-const HARDCODED_PINS = {};
-
-const LOCKED_GAME_TTL = 7200; // 2-hour lock so all connected users stay on the exact same node
+const LOCKED_GAME_TTL = 7200; // 2-hour hard lock
 const cache = new Map();
 const pinnedLog = new Map();
 
@@ -53,7 +50,6 @@ async function fetchDohUpstream(url, rawQueryBuffer, timeoutMs = 2500) {
   }
 }
 
-// Enforce single-IP pinning so all users on your link hit the exact same relay server
 function pinSingleIpResponse(decodedResp, domain) {
   if (!decodedResp.answers || decodedResp.answers.length === 0) return decodedResp;
 
@@ -61,7 +57,6 @@ function pinSingleIpResponse(decodedResp, domain) {
   const cnameRecords = decodedResp.answers.filter(a => a.type === 'CNAME');
 
   if (aRecords.length > 0) {
-    // Pick the primary deterministic IPv4 record and strip alternates
     const chosen = aRecords[0];
     chosen.ttl = LOCKED_GAME_TTL;
     decodedResp.answers = [...cnameRecords, chosen];
@@ -82,7 +77,6 @@ async function resolveQuery(rawQueryBuffer) {
   const qType = question ? question.type : '';
   const gameTraffic = isGameDomain(qName);
 
-  // Drop IPv6 (AAAA) for game domains to prevent dual-stack mobile carrier jitter
   if (gameTraffic && qType === 'AAAA') {
     return dnsPacket.encode({
       id: decoded.id,
@@ -90,23 +84,6 @@ async function resolveQuery(rawQueryBuffer) {
       flags: 384,
       questions: decoded.questions,
       answers: []
-    });
-  }
-
-  // Serve directly if a manual static IP override is configured
-  if (gameTraffic && qType === 'A' && HARDCODED_PINS[qName]) {
-    return dnsPacket.encode({
-      id: decoded.id,
-      type: 'response',
-      flags: 384,
-      questions: decoded.questions,
-      answers: [{
-        type: 'A',
-        class: 'IN',
-        name: question.name,
-        ttl: LOCKED_GAME_TTL,
-        data: HARDCODED_PINS[qName]
-      }]
     });
   }
 
@@ -150,16 +127,16 @@ async function resolveQuery(rawQueryBuffer) {
 
 app.use(express.raw({ type: 'application/dns-message', limit: '1mb' }));
 
-app.get('/', (req, res) => {
-  res.status(200).send('Shared-Pool Gaming DoH Booster Active');
-});
-
-// Live dashboard showing the exact game domains & locked IPs
+// --- PLACED FIRST TO FIX THE ROUTING CONFLICT ---
 app.get('/stats', (req, res) => {
   res.status(200).json({
     activeCacheEntries: cache.size,
     pinnedGameRoutes: Object.fromEntries(pinnedLog)
   });
+});
+
+app.get('/', (req, res) => {
+  res.status(200).send('Shared-Pool Gaming DoH Booster Active');
 });
 
 async function handleDoh(req, res) {
