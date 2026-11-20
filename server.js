@@ -3,25 +3,56 @@ const app = express();
 
 const PORT = process.env.PORT || 3000;
 
-// Optimized Upstream Resolvers (Using primary high-performance low-latency nodes)
+// Optimized Upstream Resolvers
 const UPSTREAMS = (process.env.UPSTREAMS ||
   'https://cloudflare-dns.com/dns-query,https://dns.google/dns-query'
 ).split(',').map(u => u.trim()).filter(Boolean);
 
 const RACE = process.env.RACE !== 'false';
-const UPSTREAM_TIMEOUT_MS = 2000; // Reduced timeout for faster failover/response
+const UPSTREAM_TIMEOUT_MS = 2000;
 
-// ---------- Expanded In-Memory DNS Cache for Zero-Lag Gaming ----------
-const CACHE_MAX = 10000; // Expanded cache size to remember game server IPs longer
-const MIN_TTL = 60;      // Minimum cache time increased to 60s to prevent constant re-querying
-const MAX_TTL = 3600;  // Max cache time up to 1 hour for stable session mapping
+// ---------- In-Memory DNS Cache ----------
+const CACHE_MAX = 10000;
+const MIN_TTL = 60;
+const MAX_TTL = 3600;
 const cache = new Map();
+const domainStats = new Map();
 
 function cacheKey(query) {
   const copy = Buffer.from(query);
-  copy[0] = 0; 
+  copy[0] = 0;
   copy[1] = 0;
   return copy.toString('base64');
+}
+
+function extractDomain(buf) {
+  try {
+    let o = 12;
+    const labels = [];
+    while (o < buf.length) {
+      const len = buf[o];
+      if (len === 0) break;
+      if ((len & 0xc0) === 0xc0) break;
+      labels.push(buf.toString('utf8', o + 1, o + 1 + len));
+      o += len + 1;
+    }
+    return labels.join('.').toLowerCase() || 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+function recordDomainHit(query, fromCache) {
+  const domain = extractDomain(query);
+  const current = domainStats.get(domain) || {
+    queries: 0,
+    cacheHits: 0,
+    lastSeen: null,
+  };
+  current.queries += 1;
+  if (fromCache) current.cacheHits += 1;
+  current.lastSeen = new Date().toISOString();
+  domainStats.set(domain, current);
 }
 
 function skipName(buf, o) {
@@ -66,7 +97,7 @@ function cacheGet(query) {
     return null;
   }
   const out = Buffer.from(hit.buf);
-  out[0] = query[0]; 
+  out[0] = query[0];
   out[1] = query[1];
   return out;
 }
@@ -99,7 +130,10 @@ async function askUpstream(url, query, ctrl) {
 
 async function resolve(query) {
   const cached = cacheGet(query);
-  if (cached) return cached;
+  if (cached) {
+    recordDomainHit(query, true);
+    return cached;
+  }
 
   let buf;
   if (RACE) {
@@ -121,6 +155,8 @@ async function resolve(query) {
     }
     if (!buf) throw lastErr;
   }
+
+  recordDomainHit(query, false);
   cacheSet(query, buf);
   return buf;
 }
@@ -136,13 +172,27 @@ app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', cached: cache.size, uptime: process.uptime() });
 });
 
+app.get('/stats', (req, res) => {
+  const topDomains = Array.from(domainStats.entries())
+    .sort((a, b) => b[1].queries - a[1].queries)
+    .slice(0, 50)
+    .map(([domain, info]) => ({ domain, ...info }));
+
+  res.status(200).json({
+    cachedEntries: cache.size,
+    trackedDomains: domainStats.size,
+    uptimeSeconds: Math.floor(process.uptime()),
+    topDomains,
+  });
+});
+
 async function handleDoh(req, res) {
   let query = null;
 
   if (req.method === 'POST' && Buffer.isBuffer(req.body) && req.body.length > 0) {
-    query = req.body; 
+    query = req.body;
   } else if (req.method === 'GET' && typeof req.query.dns === 'string') {
-    query = Buffer.from(req.query.dns, 'base64url'); 
+    query = Buffer.from(req.query.dns, 'base64url');
   }
 
   if (!query || query.length < 12) {
